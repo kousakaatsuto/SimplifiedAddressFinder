@@ -141,12 +141,9 @@ namespace SimplifiedAddressFinder {
 
                                 if (finalizedstring.length() > 5) {
                                     if (finalizedstring.find("::") != std::string::npos ||
-                                        finalizedstring.find("Component") != std::string::npos ||
-                                        finalizedstring.find("Packet") != std::string::npos ||
                                         finalizedstring.find("void") != std::string::npos ||
                                         finalizedstring.find("bool") != std::string::npos ||
                                         finalizedstring.find("int") != std::string::npos ||
-                                        finalizedstring.find("System") != std::string::npos ||
                                         finalizedstring.find("lambda") != std::string::npos)
                                     {
                                         if (matched.empty()) {
