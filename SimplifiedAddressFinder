@@ -1,0 +1,310 @@
+#pragma once
+#include <windows.h>
+#include <string>
+#include <vector>
+#include <iostream>
+#include <iomanip>
+#include <tlhelp32.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+
+namespace SimplifiedAddressFinder {
+    //a structure for maintain detail informations.
+    struct AttributeDetail {
+        std::string predictedname = "";
+        uintptr_t address = 0;
+        uintptr_t offset = 0;
+    };
+
+    //a variable that maintains found particulars/elements.
+    static inline std::vector<AttributeDetail> FoundParticulars = {};
+
+    //a namespace who handles background sided process.
+    namespace Background {
+        //a variable for saving window.
+        inline static HWND window = NULL;
+
+        //a variable for saving basesize.
+        inline static uintptr_t base = 0;
+
+        //a variable for saving modulesize.
+        inline static uintptr_t module = 0;
+
+        //a variable for monitor current conditions.
+        static inline std::vector<std::string> PresentConditionsList = {};
+
+        //a variable for monitor currently registered conditions that filter the result of system.
+        static inline std::vector<std::string> PresentRegisteredConditions = {};
+
+        //a function that checks "does the target meet present conditions?".
+        static inline bool CheckCondition(std::string target) {
+            for (const auto& sc : PresentConditionsList) { //sc means "single condition (of vectors/checklists)".
+                if (target.find(sc) != std::string::npos) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        //a function that checks "is the target readable or executable?".
+        static inline bool IsTargetSafeToRead(HANDLE process, uintptr_t address, bool checkexecutability = false) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi))) {
+                bool is_accessible = (mbi.State == MEM_COMMIT) && !(mbi.Protect & PAGE_NOACCESS);
+                if (!is_accessible) return false;
+
+                if (checkexecutability) {
+                    return (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE));
+                }
+                return true;
+            }
+            return false;
+        }
+
+        //a function that checks "is the target readable?" w/try and except.
+        static inline bool SafeRead(HANDLE process, uintptr_t address, void* out_buffer, size_t size) {
+            SIZE_T readbytes = 0;
+            __try {
+                if (ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), out_buffer, size, &readbytes)) {
+                    return readbytes == size;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            return false;
+        }
+
+        //it calculates the size of module/process.
+        static inline uintptr_t GetModuleSize(HANDLE process, HMODULE module) {
+            MODULEINFO modinfo = { 0 };
+            if (GetModuleInformation(process, module, &modinfo, sizeof(modinfo))) {
+                return modinfo.SizeOfImage;
+            }
+            return 0;
+        }
+
+        //predict the function name by analyzing machine code and referenced strings.
+        static inline std::string PredictFunctionName(HANDLE process, uintptr_t address) {
+            if (address == 0) return "";
+
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi))) {
+                return "";
+            }
+
+            if (!(mbi.State == MEM_COMMIT) || !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
+                return "";
+            }
+
+            uintptr_t maxregaddr = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+
+            std::string matched = "";
+
+            constexpr size_t size = 256;
+            std::vector<unsigned char> codebuffer(size);
+
+            uintptr_t presentaddress = address;
+
+            while (presentaddress + 7 < maxregaddr) {
+                size_t readbytes = size;
+                if (presentaddress + readbytes > maxregaddr) {
+                    readbytes = maxregaddr - presentaddress;
+                }
+
+                if (!SafeRead(process, presentaddress, codebuffer.data(), readbytes)) {
+                    break;
+                }
+
+                for (size_t i = 0; i < readbytes - 7; ++i) {
+                    uintptr_t address = presentaddress + i;
+
+                    if (codebuffer[i] == 0xC3 || codebuffer[i] == 0xCC) {
+                        if (!matched.empty()) {
+                            return matched;
+                        }
+                    }
+
+                    if (codebuffer[i] == 0x48 && codebuffer[i + 1] == 0x8D) {
+                        unsigned char op = codebuffer[i + 2];
+                        if (op == 0x05 || op == 0x0D || op == 0x15 || op == 0x1D ||
+                            op == 0x25 || op == 0x2D || op == 0x35 || op == 0x3D) {
+
+                            int32_t offset = 0;
+                            memcpy(&offset, &codebuffer[i + 3], sizeof(int32_t));
+
+                            uintptr_t next = address + 7;
+                            uintptr_t targetaddressstring = next + offset;
+
+                            char str[256];
+                            if (SafeRead(process, targetaddressstring, &str, sizeof(str) - 1)) {
+                                str[sizeof(str) - 1] = '\0';
+                                std::string finalizedstring(str);
+
+                                if (finalizedstring.length() > 5) {
+                                    if (finalizedstring.find("::") != std::string::npos ||
+                                        finalizedstring.find("Component") != std::string::npos ||
+                                        finalizedstring.find("Packet") != std::string::npos ||
+                                        finalizedstring.find("void") != std::string::npos ||
+                                        finalizedstring.find("bool") != std::string::npos ||
+                                        finalizedstring.find("int") != std::string::npos ||
+                                        finalizedstring.find("System") != std::string::npos ||
+                                        finalizedstring.find("lambda") != std::string::npos)
+                                    {
+                                        if (matched.empty()) {
+                                            matched = finalizedstring;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                presentaddress += (readbytes - 7);
+            }
+
+            return matched;
+        }
+
+        //finalize the entire process.
+        static inline void Finalization(HANDLE process, const AttributeDetail& detail) {
+            if (detail.address == 0) return;
+
+            uintptr_t vptr = 0;
+            if (!SafeRead(process, detail.address, &vptr, sizeof(vptr))) return;
+            if (vptr == 0) return;
+
+            MEMORY_BASIC_INFORMATION mbi;
+            if (!VirtualQueryEx(process, reinterpret_cast<LPCVOID>(vptr), &mbi, sizeof(mbi))) return;
+            if ((mbi.State != MEM_COMMIT) || (mbi.Protect & PAGE_NOACCESS)) return;
+
+            uintptr_t max_address = base + module;
+            AttributeDetail result = detail;
+
+            for (uintptr_t current_vptr = vptr; current_vptr + sizeof(uintptr_t) <= max_address; current_vptr += sizeof(uintptr_t)) {
+                uintptr_t functionaddress = 0;
+                if (!SafeRead(process, current_vptr, &functionaddress, sizeof(functionaddress))) break;
+                if (functionaddress == 0 || !IsTargetSafeToRead(process, functionaddress, true)) continue;
+
+                if (functionaddress < base || functionaddress >= max_address) continue;
+                if (!IsTargetSafeToRead(process, functionaddress, true)) continue;
+
+                std::string functionname = PredictFunctionName(process, functionaddress);
+                if (functionname.empty() || !CheckCondition(functionname)) continue;
+
+                result.predictedname = functionname;
+                result.offset = (functionaddress - base);
+                result.address = current_vptr;
+
+                FoundParticulars.push_back(result);
+            }
+        }
+
+        // a function that filters out non-game threads.
+        static inline DWORD GetGameThread(DWORD pid, DWORD currentthread) {
+            DWORD finalized = 0;
+            HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (snapshot != INVALID_HANDLE_VALUE) {
+                THREADENTRY32 te;
+                te.dwSize = sizeof(te);
+                if (Thread32First(snapshot, &te)) {
+                    do {
+                        if (te.th32OwnerProcessID == pid && te.th32ThreadID != currentthread) {
+                            finalized = te.th32ThreadID;
+                            break;
+                        }
+                    } while (Thread32Next(snapshot, &te));
+                }
+                CloseHandle(snapshot);
+            }
+            return finalized;
+        }
+
+        //a funtion that copies threadcontext and analyzes readable stuff.
+        static inline void CopyAndHandleThreadContext() {
+            if (base == 0) {
+                base = reinterpret_cast<uintptr_t>(GetModuleHandleA(NULL));
+                if (base == 0) return;
+            }
+
+            if (!window) return;
+
+            DWORD pid = 0;
+            GetWindowThreadProcessId(window, &pid);
+            if (!pid) return;
+
+            DWORD current = GetCurrentThreadId();
+            DWORD finalized = GetGameThread(pid, current);
+            if (!finalized) return;
+
+            HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, finalized);
+            if (!thread) return;
+
+            if (SuspendThread(thread) == (DWORD)-1) {
+                CloseHandle(thread);
+                return;
+            }
+
+            CONTEXT ctx = { 0 };
+            ctx.ContextFlags = CONTEXT_FULL;
+            std::vector<AttributeDetail> details;
+
+            if (GetThreadContext(thread, &ctx)) {
+                details = {
+                    {"RAX", ctx.Rax}, {"RCX", ctx.Rcx}, {"RDX", ctx.Rdx}, {"RBX", ctx.Rbx},
+                    {"RBP", ctx.Rbp}, {"RSP", ctx.Rsp}, {"RSI", ctx.Rsi}, {"RDI", ctx.Rdi},
+                    {"R8",  ctx.R8},  {"R9",  ctx.R9},  {"R10", ctx.R10}, {"R11", ctx.R11},
+                    {"R12", ctx.R12}, {"R13", ctx.R13}, {"R14", ctx.R14}, {"R15", ctx.R15}
+                };
+            }
+
+            ResumeThread(thread);
+            CloseHandle(thread);
+
+            if (details.empty()) return;
+
+            HANDLE process = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+            if (process) {
+                for (const auto& reg : details) {
+                    Finalization(process, reg);
+                }
+                CloseHandle(process);
+            }
+        }
+    }
+    //main engine
+
+    static inline bool RunEngine = false;
+
+    static inline int SleepAmount = 1000;
+
+    static inline std::string Window = "";
+
+    //the initialization (setup.)
+    static inline void InitializeEngine(const std::string& windowName = "") {
+        Window = windowName;
+        Background::window = FindWindowA(NULL, Window.c_str());
+        RunEngine = true;
+
+        while (RunEngine) {
+            if (Background::base == 0) {
+                Background::base = reinterpret_cast<uintptr_t>(GetModuleHandleA(NULL));
+                if (Background::base != 0) Background::module = Background::GetModuleSize(GetCurrentProcess(), reinterpret_cast<HMODULE>(Background::base));
+            }
+            Background::window = FindWindowA(NULL, Window.c_str());
+            if (Background::window == NULL) break;
+            Background::CopyAndHandleThreadContext();
+            Sleep(SleepAmount);
+        }
+    }
+
+    //the uninitialization
+    static inline void UninitializeEngine() {
+        RunEngine = false;
+        Background::window = NULL;
+    }
+
+    //a function that replaces conditions.
+    static inline void ReplaceConditions(std::initializer_list<std::string> strings) {
+        Background::PresentConditionsList = strings;
+    }
+}
