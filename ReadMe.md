@@ -1,3 +1,31 @@
+## 使い方
+
+セットアップで
+SimplifiedAddressFinder::ReplaceConditions({ "" }); //ここで捜索する条件を決めることができます。
+）    std::thread initialization([]() {
+        SimplifiedAddressFinder::InitializeEngine(""); //ここにウィンドウの名前を入れてください。 (例 Untitled - Paint)
+    });
+    engineThread.detach();
+
+インジェクションツールを使用してプロセスに処理を埋め込み、処理します。
+
+捜索で当てはまったものは
+SimplifiedAddressFinder::FoundParticulars
+にデータが保存されています。
+
+for (const auto& detail : SimplifiedAddressFinder::FoundParticulars) {
+            std::cout << "Name: " << detail.predictedname 
+                      << " | Address: 0x" << std::hex << detail.address 
+                      << " | Offset: 0x" << detail.offset << std::endl;
+}
+SimplifiedAddressFinder::FoundParticulars.clear();
+
+等で結果を見ることができます。 (前提として標準出力をコンソールに割り当てる事が必須になります。)
+
+シャットダウンには
+SimplifiedAddressFinder::UninitializeEngine();
+を使用します。
+
 ## Disclaimer (免責事項)
 
 本リポジトリで公開しているコードおよびツール（SimplifiedAddressFinder）は、**ソフトウェアのデバッグ技術、リバースエンジニアリングの学習、および開発目的のみ**を想定して作成された実験的なサンプルです。
